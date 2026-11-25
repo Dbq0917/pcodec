@@ -163,7 +163,7 @@ impl<R: BetterBufRead> PageDecompressorState<R> {
     cd: &ChunkDecompressorInner,
     range: Range<usize>,
     scratch: &mut DecompressorScratchInner,
-    dst: &mut DynNumberDst,
+    dst: Option<&mut DynNumberDst>,
   ) -> PcoResult<()> {
     let batch_n = range.len();
     let n_remaining = self.n_remaining;
@@ -205,23 +205,43 @@ impl<R: BetterBufRead> PageDecompressorState<R> {
       None => None,
     };
 
-    match_number_enum!(
-      dst,
-      DynNumberDst<T>(dst) => {
-        T::join_latents(
-          &cd.meta.mode,
-          primary,
-          secondary,
-          &mut dst[range],
-        )?;
-      }
-    );
+    if let Some(dst) = dst {
+      match_number_enum!(
+        dst,
+        DynNumberDst<T>(dst) => {
+          T::join_latents(
+            &cd.meta.mode,
+            primary,
+            secondary,
+            &mut dst[range],
+          )?;
+        }
+      );
+    }
 
     self.n_remaining -= batch_n;
     if self.n_remaining == 0 {
       drain_page_end(&mut self.reader_builder)?;
     }
 
+    Ok(())
+  }
+
+  // Decodes and discards `n_to_skip` numbers, advancing every sequential
+  // decoder (ANS state machines and delta state) exactly as if the values had
+  // been read, but without touching a caller-provided destination.
+  fn skip_batches(
+    &mut self,
+    cd: &ChunkDecompressorInner,
+    n_to_skip: usize,
+    scratch: &mut DecompressorScratchInner,
+  ) -> PcoResult<()> {
+    let mut n_processed = 0;
+    while n_processed < n_to_skip {
+      let batch_end = min(n_processed + FULL_BATCH_N, n_to_skip);
+      self.read_batch(cd, n_processed..batch_end, scratch, None)?;
+      n_processed = batch_end;
+    }
     Ok(())
   }
 
@@ -250,7 +270,7 @@ impl<R: BetterBufRead> PageDecompressorState<R> {
         cd,
         n_processed..dst_batch_end,
         &mut scratch.0,
-        &mut dst,
+        Some(&mut dst),
       )?;
       n_processed = dst_batch_end;
     }
@@ -259,6 +279,52 @@ impl<R: BetterBufRead> PageDecompressorState<R> {
       n_processed,
       finished: self.n_remaining == 0,
     })
+  }
+
+  // Skips the next `n` numbers in the page without writing them anywhere.
+  // `n` must be a multiple of FULL_BATCH_N unless it reaches the end of the
+  // page, matching the alignment contract of `read`.
+  pub fn skip(
+    &mut self,
+    cd: &ChunkDecompressorInner,
+    scratch: &mut DecompressorScratch,
+    n: usize,
+  ) -> PcoResult<Progress> {
+    let n_remaining = self.n_remaining;
+    if n > n_remaining {
+      return Err(PcoError::invalid_argument(format!(
+        "cannot skip {} numbers; only {} remain in the page",
+        n, n_remaining,
+      )));
+    }
+    if !n.is_multiple_of(FULL_BATCH_N) && n < n_remaining {
+      return Err(PcoError::invalid_argument(format!(
+        "skip count must either be a multiple of {} or reach the \
+         end of the page ({} was given, {} remain)",
+        FULL_BATCH_N, n, n_remaining,
+      )));
+    }
+
+    self.skip_batches(cd, n, &mut scratch.0)?;
+
+    Ok(Progress {
+      n_processed: n,
+      finished: self.n_remaining == 0,
+    })
+  }
+
+  // Reads a sub-range of the page starting at its current position. The
+  // leading `skip` numbers are decoded and discarded so that all sequential
+  // state stays consistent; only the following values land in `dst`.
+  pub fn read_range(
+    &mut self,
+    cd: &ChunkDecompressorInner,
+    scratch: &mut DecompressorScratch,
+    skip: usize,
+    dst: DynNumberDst,
+  ) -> PcoResult<Progress> {
+    self.skip(cd, scratch, skip)?;
+    self.read(cd, scratch, dst)
   }
 
   pub fn into_src(self) -> R {
@@ -311,6 +377,55 @@ impl<'a, T: Number, R: BetterBufRead> PageDecompressor<'a, T, R> {
     self
       .state
       .read(self.cd, self.scratch, DynNumberDst::new(dst))
+  }
+
+  /// Skips the next `n` numbers in the page, consuming their compressed bytes
+  /// but without writing them to a destination.
+  ///
+  /// This makes it possible to reach a narrow sub-range of a large page while
+  /// only allocating an output buffer for the values actually wanted. The
+  /// skipped numbers are still run through the sequential ANS and delta
+  /// decoders (their state cannot be jumped over), so CPU cost is comparable
+  /// to decoding them, but no per-page destination buffer is required and the
+  /// scratch space stays a single
+  /// [`FULL_BATCH_N`][crate::FULL_BATCH_N]-sized batch.
+  ///
+  /// `n` must be a multiple of [`FULL_BATCH_N`][crate::FULL_BATCH_N] unless it
+  /// reaches the end of the page.
+  pub fn skip(&mut self, n: usize) -> PcoResult<Progress> {
+    self.state.skip(self.cd, self.scratch, n)
+  }
+
+  /// Skips `skip` numbers and then reads the following numbers into `dst`.
+  ///
+  /// This is a convenience for narrow range reads: only `dst` needs to be
+  /// sized for the requested values, while the leading numbers are decoded and
+  /// discarded internally. `skip` must be a multiple of
+  /// [`FULL_BATCH_N`][crate::FULL_BATCH_N], and the usual
+  /// [`read`][Self::read] alignment rules apply to `dst`.
+  pub fn read_range(&mut self, skip: usize, dst: &mut [T]) -> PcoResult<Progress> {
+    // safety: this only ever writes initialized values
+    unsafe {
+      self.read_range_uninit(
+        skip,
+        mem::transmute::<&mut [T], &mut [MaybeUninit<T>]>(dst),
+      )
+    }
+  }
+
+  /// Like [`read_range`][Self::read_range], but writes into a possibly
+  /// uninitialized destination.
+  pub fn read_range_uninit(
+    &mut self,
+    skip: usize,
+    dst: &mut [MaybeUninit<T>],
+  ) -> PcoResult<Progress> {
+    self.state.read_range(
+      self.cd,
+      self.scratch,
+      skip,
+      DynNumberDst::new(dst),
+    )
   }
 
   /// Returns the rest of the compressed data source.

@@ -5,7 +5,7 @@ use std::mem::{self, MaybeUninit};
 use crate::chunk_config::ChunkConfig;
 use crate::data_types::{Number, NumberType};
 use crate::dyn_slices::DynNumberSlice;
-use crate::errors::PcoResult;
+use crate::errors::{PcoError, PcoResult};
 use crate::progress::Progress;
 use crate::standalone::compressor::FileCompressor;
 use crate::standalone::decompressor::{DecompressorItem, FileDecompressor};
@@ -170,6 +170,76 @@ pub fn simple_decompress_into_uninit<T: Number>(
 pub fn simple_decompress<T: Number>(src: &[u8]) -> PcoResult<Vec<T>> {
   let (file_decompressor, src) = FileDecompressor::new(src)?;
   file_decompressor.simple_decompress(src)
+}
+
+/// Decompresses only the `dst.len()` numbers starting at index `start`.
+///
+/// This is the narrow range-read entry point: the caller allocates an output
+/// buffer sized only for the requested slice, while every number before
+/// `start` is decoded and discarded internally rather than buffered. Chunks
+/// (standalone's unit of paging) preceding the one containing `start` are
+/// skipped in full, so the output memory peak stays proportional to the
+/// requested range plus a single
+/// [`FULL_BATCH_N`][crate::FULL_BATCH_N]-sized scratch batch instead of the
+/// whole file.
+///
+/// `start` must be a multiple of [`FULL_BATCH_N`][crate::FULL_BATCH_N] unless
+/// it lands at a chunk boundary; compressing with a power-of-two
+/// [`PagingSpec::Pow2`][crate::PagingSpec::Pow2] keeps every such boundary
+/// batch-aligned. The same alignment rule applies to all but the final write
+/// into `dst`.
+pub fn simple_decompress_range<T: Number>(
+  src: &[u8],
+  mut start: usize,
+  dst: &mut [T],
+) -> PcoResult<Progress> {
+  let (file_decompressor, mut src) = FileDecompressor::new(src)?;
+  let mut progress = Progress::default();
+  let mut dst = dst;
+  let total_requested = start + dst.len();
+  let mut seen = 0usize;
+
+  while !dst.is_empty() {
+    let chunk_decompressor = file_decompressor.chunk_decompressor::<T, _>(src)?;
+    let mut chunk_decompressor = match chunk_decompressor {
+      DecompressorItem::Chunk(cd) => cd,
+      DecompressorItem::EndOfData(_) => {
+        return Err(PcoError::invalid_argument(format!(
+          "requested range ending at {} extends past end of file ({} numbers)",
+          total_requested, seen,
+        )))
+      }
+    };
+
+    let chunk_n = chunk_decompressor.n();
+    seen += chunk_n;
+    if start >= chunk_n {
+      // The requested range begins in a later chunk; consume this whole chunk
+      // without retaining any of its values.
+      chunk_decompressor.skip(chunk_n)?;
+      start -= chunk_n;
+      src = chunk_decompressor.into_src();
+      continue;
+    }
+
+    if start > 0 {
+      chunk_decompressor.skip(start)?;
+      start = 0;
+    }
+
+    let chunk_progress = chunk_decompressor.read(dst)?;
+    let n = chunk_progress.n_processed;
+    progress.n_processed += n;
+    dst = &mut dst[n..];
+
+    src = chunk_decompressor.into_src();
+    if dst.is_empty() {
+      break;
+    }
+  }
+
+  progress.finished = dst.is_empty();
+  Ok(progress)
 }
 
 #[cfg(test)]

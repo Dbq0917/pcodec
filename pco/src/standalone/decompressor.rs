@@ -4,7 +4,7 @@ use std::{cmp, mem};
 use better_io::BetterBufRead;
 
 use crate::bit_reader::{BitReader, BitReaderBuilder};
-use crate::constants::{Bitlen, OVERSHOOT_PADDING};
+use crate::constants::{Bitlen, FULL_BATCH_N, OVERSHOOT_PADDING};
 use crate::data_types::{Number, NumberType};
 use crate::dyn_slices::DynNumberDst;
 use crate::errors::{PcoError, PcoResult};
@@ -339,6 +339,56 @@ impl<T: Number, R: BetterBufRead> ChunkDecompressor<T, R> {
     self.n_processed += progress.n_processed;
 
     Ok(progress)
+  }
+
+  /// Skips the next `n` numbers in the chunk, consuming their compressed
+  /// bytes but writing nothing to a destination.
+  ///
+  /// Combined with [`read`][Self::read], this allows a narrow range of a large
+  /// chunk to be fetched with an output buffer sized only for the requested
+  /// values, rather than the whole chunk. `n` must be a multiple of
+  /// [`FULL_BATCH_N`][crate::FULL_BATCH_N] unless it reaches the end of the
+  /// chunk.
+  pub fn skip(&mut self, n: usize) -> PcoResult<Progress> {
+    let (inner, scratch) = self.inner_cd.inner_and_scratch();
+    let progress = self.page_state.skip(inner, scratch, n)?;
+    self.n_processed += progress.n_processed;
+    Ok(progress)
+  }
+
+  /// Reads only `dst.len()` numbers starting at element `start` of the chunk.
+  ///
+  /// The `start` leading numbers are decoded and discarded internally, so the
+  /// caller only allocates an output buffer for the requested slice. `start`
+  /// must be a multiple of [`FULL_BATCH_N`][crate::FULL_BATCH_N]; use
+  /// [`skip`][Self::skip] and [`read`][Self::read] directly for finer control
+  /// over final partial batches.
+  pub fn read_range(&mut self, start: usize, dst: &mut [T]) -> PcoResult<Progress> {
+    // safety: this only ever writes initialized values
+    unsafe {
+      self.read_range_uninit(
+        start,
+        mem::transmute::<&mut [T], &mut [MaybeUninit<T>]>(dst),
+      )
+    }
+  }
+
+  /// Like [`read_range`][Self::read_range], but writes into a possibly
+  /// uninitialized destination.
+  pub fn read_range_uninit(
+    &mut self,
+    start: usize,
+    dst: &mut [MaybeUninit<T>],
+  ) -> PcoResult<Progress> {
+    if !start.is_multiple_of(FULL_BATCH_N) {
+      return Err(PcoError::invalid_argument(format!(
+        "range start must be a multiple of {} (was {})",
+        FULL_BATCH_N, start,
+      )));
+    }
+    let skip_progress = self.skip(start)?;
+    debug_assert_eq!(skip_progress.n_processed, start);
+    self.read_uninit(dst)
   }
 
   /// Returns the rest of the compressed data source.

@@ -110,6 +110,34 @@ chunk size there.
 | page  | interleaving w/ wrapping format | \>1k numbers              |
 | batch | decompression                   | 256 numbers (fixed)       |
 
+### Range Reads
+
+The smallest unit Pco can independently locate is a page, and within a page
+the ANS state machine and delta state must be advanced sequentially.
+Fetching a narrow range therefore has two costs: locating the containing page
+and decoding through the values preceding the requested ones inside it.
+
+To keep random reads cheap without giving back much compression ratio:
+
+* Make the page size match the access pattern via
+  [`PagingSpec`][`PagingSpec`]. `PagingSpec::Pow2(log)` produces fixed-size,
+  power-of-two-aligned pages so an outer format can map element `i` to its
+  page with a shift (`i >> log`) and no offset table.
+* Read only the wanted slice. The range-read functions
+  (`standalone::simple_decompress_range`, or `PageDecompressor::skip` /
+  `read_range` on the wrapped API) decode and discard the leading values
+  internally, so the output buffer only needs to hold the requested range
+  rather than a whole page. Scratch stays a single 256-element batch
+  regardless of page size.
+
+Skipped values still pass through the decoder (their state cannot be jumped
+over), so range reads trade a bounded amount of CPU for a large, predictable
+reduction in output memory. Very small pages reduce how far a deep read must
+decode, but each page carries its own metadata and a chunk only shares
+compression state across its pages; shrinking pages below roughly 10k numbers
+starts to cost compression ratio. An example benchmark and a page-size sweep
+live in `pco/examples/range_read_bench.rs`.
+
 ### Pitfalls
 
 Compression will be disappointing if the data in a single chunk

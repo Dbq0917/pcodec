@@ -121,6 +121,20 @@ pub enum PagingSpec {
   /// For example, with equal pages up to 100,000, a chunk of 150,000
   /// numbers would be divided into 2 pages, each of 75,000 numbers.
   EqualPagesUpTo(usize),
+  /// Divide the chunk into pages of exactly `1 << page_size_log` numbers,
+  /// except for the final page, which holds the remainder.
+  ///
+  /// Unlike [`EqualPagesUpTo`][Self::EqualPagesUpTo], this makes every
+  /// non-final page the same size and aligned to a power-of-two boundary.
+  /// That lets random-access workloads locate the page containing element
+  /// `i` as `i >> page_size_log` without consulting any offset table, which
+  /// is convenient when Pco pages are embedded in an outer storage format
+  /// (Parquet row groups, object-store chunks, etc.) and fetched
+  /// independently.
+  ///
+  /// For example, `Pow2(10)` splits a chunk of 2,500 numbers into pages of
+  /// sizes 1,024, 1,024, and 452.
+  Pow2(usize),
   /// Divide the chunk into the exactly provided counts.
   ///
   /// Will return an InvalidArgument error during compression if
@@ -165,6 +179,20 @@ impl PagingSpec {
         debug_assert!(r == 0 || page_n_high <= *max_page_n);
         let mut res = vec![page_n_low; n_pages];
         res[..r].fill(page_n_high);
+        res
+      }
+      PagingSpec::Pow2(page_size_log) => {
+        let page_n = 1_usize.checked_shl(*page_size_log as u32).ok_or_else(|| {
+          PcoError::invalid_argument(format!(
+            "page size log {} is too large",
+            page_size_log
+          ))
+        })?;
+        let n_pages = n.div_ceil(page_n);
+        let mut res = vec![page_n; n_pages];
+        if !n.is_multiple_of(page_n) {
+          res[n_pages - 1] = n % page_n;
+        }
         res
       }
       PagingSpec::Exact(n_per_page) => n_per_page.to_vec(),

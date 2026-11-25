@@ -1,6 +1,7 @@
 mod compatibility;
 mod corruption;
 mod low_level;
+mod range_reads;
 mod recovery;
 mod scratch_reuse;
 mod stability;

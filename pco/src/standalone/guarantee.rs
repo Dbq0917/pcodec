@@ -88,4 +88,14 @@ mod tests {
     };
     check_file_guarantee(&nums, &config)
   }
+
+  #[test]
+  fn test_file_guarantee_pow2_paging() -> PcoResult<()> {
+    let nums: Vec<i64> = (0..10_000).map(|i| i * 3 - 7).collect();
+    let config = ChunkConfig {
+      paging_spec: PagingSpec::Pow2(10),
+      ..Default::default()
+    };
+    check_file_guarantee(&nums, &config)
+  }
 }
